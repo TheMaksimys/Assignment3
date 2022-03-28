@@ -10,11 +10,13 @@
 #define ANALOGREADPIN 17
 #define DIGITALINPUTPIN 22 // Pin for the pushbutton input
 #define SIGNALPIN 18 // Pin for the external square wave input
-
+#define ERRORPIN 23 // Pin for the error indication LED
 // Defining global variables
 
 unsigned int analogReading; // Very last value to be stored from the ADC
 
+ int temp;
+ unsigned int errorCode; // value to pass between the analog error detection
 
 //Defining subroutines to be run using RTOS shedulling
 void Watchdog(void *Parameters);
@@ -23,9 +25,12 @@ void AnalogAverage(void *Parameters);
 void Nop1000times(void *Parameters);
 void DigitalInput(void *Parameters);
 void FrequencyMeasure(void *Parameters);
+void ErrorCheck(void *Parameters);
+void ErrorDisplay(void *Parameters);
 
 static SemaphoreHandle_t  analogSMP=NULL; 
 static SemaphoreHandle_t  dataOutSMP=NULL; 
+static SemaphoreHandle_t  errorSMP=NULL; 
 
 struct memory{
   char buttonInput;
@@ -44,11 +49,14 @@ pinMode(DIGITALINPUTPIN, INPUT);
 pinMode(DIGITALINPUTPIN, INPUT_PULLDOWN); // Prevents pin from being floating 
 pinMode(SIGNALPIN, INPUT);
 pinMode(SIGNALPIN, INPUT_PULLDOWN); // Prevents pin from being floating 
+  pinMode(ERRORPIN, OUTPUT);
 
 analogSMP = xSemaphoreCreateBinary();
 dataOutSMP = xSemaphoreCreateBinary();
+errorSMP = xSemaphoreCreateBinary();
 
-  if(analogSMP==NULL||dataOutSMP==NULL)
+
+  if(analogSMP==NULL||dataOutSMP==NULL || errorSMP == NULL)
   {
     Serial.print("Could not create semaphore");
     ESP.restart();
@@ -59,7 +67,7 @@ dataOutSMP = xSemaphoreCreateBinary();
   xTaskCreatePinnedToCore(
     Watchdog
     ,  "Watchdog"   // A name just for humans
-    ,  550  // This stack size can be checked & adjusted by reading the Stack Highwater
+    ,  570  // This stack size can be checked & adjusted by reading the Stack Highwater
     ,  NULL
     ,  2  // Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
     ,  NULL // task handler
@@ -68,7 +76,7 @@ dataOutSMP = xSemaphoreCreateBinary();
   xTaskCreatePinnedToCore(
     AnalogRead
     ,  "AnalogRead"   // A name just for humans
-    ,  720  // This stack size can be checked & adjusted by reading the Stack Highwater
+    ,  740  // This stack size can be checked & adjusted by reading the Stack Highwater
     ,  NULL
     ,  1  // Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
     ,  NULL // task handler
@@ -107,7 +115,25 @@ dataOutSMP = xSemaphoreCreateBinary();
             xTaskCreatePinnedToCore(
    FrequencyMeasure
     ,  "FrequencyMeasure"   // A name just for humans
-    ,  2048 // This stack size can be checked & adjusted by reading the Stack Highwater
+    ,  540 // This stack size can be checked & adjusted by reading the Stack Highwater
+    ,  NULL
+    ,  3  // Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
+    ,  NULL // task handler
+    ,  ARDUINO_RUNNING_CORE);
+
+            xTaskCreatePinnedToCore(
+   ErrorCheck
+    ,  "ErrorCheck"   // A name just for humans
+    ,  550 // This stack size can be checked & adjusted by reading the Stack Highwater
+    ,  NULL
+    ,  3  // Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
+    ,  NULL // task handler
+    ,  ARDUINO_RUNNING_CORE);
+
+     xTaskCreatePinnedToCore(
+   ErrorDisplay
+    ,  "ErrorDisplay"   // A name just for humans
+    ,  530 // This stack size can be checked & adjusted by reading the Stack Highwater
     ,  NULL
     ,  3  // Priority, with 3 (configMAX_PRIORITIES - 1) being the highest, and 0 being the lowest.
     ,  NULL // task handler
@@ -115,7 +141,7 @@ dataOutSMP = xSemaphoreCreateBinary();
 
 
 
-xSemaphoreGive(analogSMP); // Assigning initial state to semaphores
+//xSemaphoreGive(analogSMP); // Assigning initial state to semaphores
 xSemaphoreGive(dataOutSMP);
 
 }
@@ -133,7 +159,7 @@ void AnalogRead(void *Parameters) // Reads the analog value from the ANALOGPIN p
    {
       digitalWrite(ANALOGREADPIN, HIGH); // Indicate the start of the ADC
   
-      xSemaphoreTake(analogSMP,portMAX_DELAY);
+     // xSemaphoreTake(analogSMP,portMAX_DELAY);
       analogReading = analogRead(ANALOGPIN);
       xSemaphoreGive(analogSMP);
       
@@ -158,7 +184,7 @@ void AnalogAverage(void *Parameters) // Computes average of last four analog rea
  xSemaphoreTake(analogSMP,portMAX_DELAY);
  
   analogData[analogAdress]=analogReading; // Loggin the last analog reading into the array cell
-    xSemaphoreGive(analogSMP);
+    //xSemaphoreGive(analogSMP);
    
   analogAdress++; // Icrementing array adress
 
@@ -167,7 +193,7 @@ void AnalogAverage(void *Parameters) // Computes average of last four analog rea
   dataOut.analogAverage=analogData[0]+analogData[1]+analogData[2]+analogData[3]; // Sums all values in the array
   dataOut.analogAverage=dataOut.analogAverage>>2; // Divides the sum by four to obtain average
   xSemaphoreGive(dataOutSMP);
-   vTaskDelay(42);
+   vTaskDelay(40); //42-2 for synronisation
   }
 }
 
@@ -192,7 +218,6 @@ void Nop1000times(void *Parameters) // Sets CPU in no-operation state for 1000 c
 
   }
 }
-//----------------------------------------------------------------------------------------------------------------------------------------------
 
 
 
@@ -232,7 +257,7 @@ void DigitalInput(void *Parameters) // Reads the digital state of the button
 //----------------------------------------------------------------------------------------------------------------------------------------------
 void SerialOutput(void) // Printing the data on the serial monitor
 {
-  Serial.print(dataOut.buttonInput,DEC); // Printing the button state
+  Serial.print(temp,DEC); // Printing the button state
   Serial.print(",");
     
   Serial.print(dataOut.measuredFreq,DEC); // Printing measured frequency of the 50% square signal
@@ -245,8 +270,38 @@ void SerialOutput(void) // Printing the data on the serial monitor
 //----------------------------------------------------------------------------------------------------------------------------------------------
 
 //----------------------------------------------------------------------------------------------------------------------------------------------
-void FrequencyMeasure(void *Parameters) // Function to measure the frequency of the 50% duty cycle square wave
+
+void ErrorCheck(void *Parameters) // Checks whether the average analog value is greater than the half of the maximum possible analog reading (?>(4096/2)-1)
 {
+  //600-120+64=546 (550)
+  (void) Parameters;
+  while(1){
+  xSemaphoreTake(dataOutSMP,portMAX_DELAY);
+  if(dataOut.analogAverage>2047) {errorCode = 1;} // Setting the error flag 
+  else{errorCode=0;} // Clearing the error flag
+  xSemaphoreGive(errorSMP); // synchronisation semaphore
+   xSemaphoreGive(dataOutSMP);
+     
+   vTaskDelay(333);
+  }
+  
+}
+//----------------------------------------------------------------------------------------------------------------------------------------------
+void ErrorDisplay(void *Parameters) // Toggles the LED if the error occurs
+{ //600-140+64=526 (530)
+  (void) Parameters;
+  while(1){
+    xSemaphoreTake(errorSMP,portMAX_DELAY);
+  digitalWrite(ERRORPIN,errorCode); // Switched the LED either ON or OFF
+     temp=uxTaskGetStackHighWaterMark(nullptr);
+   vTaskDelay(330); //333-3 for syncronisation
+  }
+}
+//----------------------------------------------------------------------------------------------------------------------------------------------
+
+//----------------------------------------------------------------------------------------------------------------------------------------------
+void FrequencyMeasure(void *Parameters) // Function to measure the frequency of the 50% duty cycle square wave
+{ // heap 2048-1576+64=536
   (void) Parameters;
   // Parameters to prevent function from occupying more than 3 miliseconds of the CPU time
   unsigned long measureStart; // Absolute time of the measuring start
@@ -261,13 +316,17 @@ void FrequencyMeasure(void *Parameters) // Function to measure the frequency of 
   char currentReading; // Current signal pin state
   char previousReading; // Previous signal pin state
 
-  unsigned int successDelay; // for inserting appropriate delay
+  unsigned int delayF; // for inserting appropriate delay
+ 
 
 measurement:
   while(1){
+  measureTime=0; 
+  firstTrigger=0; // assignign trigger back to zero
   
   //  vTaskSuspendAll(); // suspends the shedulling (this function gets maximum absolute priority & round-robin is disabled)
  vTaskSuspendAll();
+ 
   measureStart=micros(); // Beggining of the measurement
   previousReading=digitalRead(SIGNALPIN); // Performs the very first reading in the sequence (crucial line, do-not remove)
   while(measureTime<3000) // Prevents function from occupying more than 3 miliseconds of the CPU time
@@ -276,12 +335,12 @@ measurement:
     if ((currentReading!= previousReading) & (firstTrigger!=1)) // If the first edge was detected
     {
       stateStart=micros(); // Start counting the half-cycle duration
-       Serial.println("cycle start");
+     //  Serial.println("cycle start");
       firstTrigger=1; // assign trigger to 1 to allow the second edge detection processing    
     }  
     else if ((currentReading!= previousReading) & (firstTrigger==1)) // If the second edge was detected
     {
-       Serial.println("cycle end");
+     //  Serial.println("cycle end");
       stateFinish=micros(); // Finish counting the half-cycle duration
       
       
@@ -293,15 +352,6 @@ measurement:
       stateTime=stateFinish-stateStart; // Calculate the half-cycle duration
       dataOut.measuredFreq=500000/stateTime; // Compute frequency in Hz [f= 1/T = 2/(T/2)
       goto here;
-      
-      
-      measureTime=measureTime>>10;
-      successDelay=1000-measureTime;
-      
-      vTaskDelay(successDelay); // delay if succesfully measured frequency
-      firstTrigger=0; // assignign trigger back to zero
-      
-      goto measurement; // Restart this subroutine 
     }      
     measureFinish=micros(); // End of the measurement
     measureTime=measureFinish-measureStart; // Computing measurement time
@@ -311,12 +361,14 @@ measurement:
       //      while(xTaskResumeAll() != pdTRUE)
     //  {xTaskResumeAll(); }
 
-    Serial.println("measurement fault");
+  //  Serial.println("measurement fault");
   dataOut.measuredFreq=0; // In case of faulty measurement output zero
  here:
  xTaskResumeAll();
-  measureTime=0;
-  vTaskDelay(997);
+ measureTime=measureTime>>10;
+ delayF=1000-measureTime;
+
+  vTaskDelay(delayF);
   }
 }
 //----------------------------------------------------------------------------------------------------------------------------------------------
